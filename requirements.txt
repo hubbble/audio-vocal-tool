@@ -1,0 +1,14 @@
+# 音訊處理工具相依套件
+# 安裝：py -m pip install -r requirements.txt
+
+# 人聲分離（會自動帶入 torch / torchaudio）
+demucs>=4.0.1
+
+# 音檔讀寫、靜音偵測、合併、MP3 輸出（需搭配系統 ffmpeg）
+pydub>=0.25.1
+
+# 進度條（選用）
+tqdm>=4.66.0
+
+# 拖放式 GUI（gui.py 用；沒裝也能用按鈕加入檔案）
+tkinterdnd2>=0.4.0

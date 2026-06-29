@@ -1,0 +1,27 @@
+# 虛擬環境（數 GB，不上傳；使用者用 setup_amd_gpu.ps1 自行建立）
+.venv312/
+venv/
+.venv/
+
+# Python 暫存
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 產物
+build/
+build_tmp/
+dist/
+*.spec
+
+# 打包好的 exe（依賴本機環境、體積大；要散布請用 GitHub Releases）
+音訊處理工具.exe
+*.exe
+
+# 暫存 / 預覽
+_preview.png
+*.log
+
+# 系統檔
+Thumbs.db
+.DS_Store
