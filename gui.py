@@ -330,6 +330,8 @@ BITRATES = ["320k", "256k", "192k", "128k"]
 SUPPORTED_OUT_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus")
 
 _PCT_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%")
+# tqdm / demucs 進度列，例如 " 95%|████▌   | 1117.35/1175.85 [00:39<00:01, 30.91seconds/s]"
+_TQDM_RE = re.compile(r"^(\d{1,3})(?:\.\d+)?%\|")
 
 
 def fmt_time(sec: float) -> str:
@@ -856,6 +858,18 @@ class App:
             else:
                 proc.terminate()
 
+    def _emit_progress(self, line, i, n):
+        """tqdm / demucs 進度列 → 進度條更新；回傳是否已處理（不進日誌）。"""
+        m = _TQDM_RE.match(line)
+        if not m:
+            return False
+        pct = min(100, int(float(m.group(1))))
+        self.queue.put(("pct", i, n, pct))
+        # 狀態列顯示乾淨版本：去掉方塊圖形，只留 "95% · 1117.4/1175.9 [00:39<00:01]"
+        tail = line.rsplit("|", 1)[-1].strip()
+        self.queue.put(("sub", f"{pct}% · {tail}" if tail else f"{pct}%"))
+        return True
+
     def _worker(self, cmds):
         # PYTHONUNBUFFERED=1：強制子程序即時輸出，否則 Demucs 進度條會卡在
         # 緩衝區裡，畫面看起來像當機。
@@ -884,12 +898,18 @@ class App:
                     if not ch:
                         break
                     if ch == "\n":
-                        self.queue.put(("log", buf + "\n"))
+                        # tqdm 在非終端機環境會改用換行輸出進度列，
+                        # 一樣要攔下來轉成進度條，不然會洗版日誌
+                        line = buf.strip()
+                        if line and not self._emit_progress(line, i, n):
+                            self.queue.put(("log", buf + "\n"))
                         buf = ""
                     elif ch == "\r":
                         line = buf.strip()
                         buf = ""
                         if not line:
+                            continue
+                        if self._emit_progress(line, i, n):
                             continue
                         m = _PCT_RE.search(line)
                         if m:
