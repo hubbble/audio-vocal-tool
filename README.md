@@ -9,6 +9,7 @@
 ## 功能
 
 - 🎤 **人聲分離** — 把人聲乾淨地抽出來，去除背景雜音與音樂（用 [Demucs](https://github.com/facebookresearch/demucs)）
+- 🗣️ **分離不同說話人** — 兩人以上對話自動切成各自的音檔（用 [pyannote](https://github.com/pyannote/pyannote-audio) 語者分離）
 - 🔇 **去除靜音** — 移除音檔中無聲 / 空白的片段
 - 🔗 **合併輸出** — 把多個音檔合併成一個，輸出成 MP3
 - ✂️ **自選剪輯** — 在波形上拖曳選取要剪掉的片段，可試聽後再輸出
@@ -170,7 +171,31 @@ py audio_tool.py normalize input.mp3 -o norm.mp3 --mode peak
 - LUFS 模式會先量測一次再套用（兩段式 loudnorm），輸出響度非常精準。
 - 多個檔案一起標準化後音量聽感會一致，適合合併前先處理。
 
-### 10. 批次處理整個資料夾
+### 10. 分離不同說話人（語者分離）
+
+把一段兩人（或多人）對話，切成每個說話人各自的音檔：
+
+```powershell
+py audio_tool.py speakers 訪談.mp3 -o out/
+# 輸出 out/訪談_speaker1.mp3、out/訪談_speaker2.mp3
+```
+
+- `--speakers 2` 指定人數（預設 2，`0` = 自動偵測）。
+- **兩人同時說話的重疊片段預設直接捨棄**（各自的輸出都乾淨）；想保留就加 `--keep-overlap`。
+- 底層用 pyannote 語者分離模型，支援 GPU 加速（`-d cuda`）。
+
+**首次使用需要免費的 Hugging Face token**：
+
+1. 到 <https://huggingface.co> 註冊帳號
+2. 到 [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) 和
+   [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+   兩個模型頁面按「Agree and access repository」
+3. 到 [Settings → Access Tokens](https://huggingface.co/settings/tokens) 建立 **Read** token
+4. 把 token 存成專案資料夾裡的 `.hf_token` 檔（純文字一行；已被 gitignore，不會外洩）
+
+> 適用於輪流說話的對話（訪談、podcast）。若有背景音樂，建議先跑「人聲分離」再跑這個。
+
+### 11. 批次處理整個資料夾
 
 ```powershell
 # 把資料夾內所有影片轉成 mp3

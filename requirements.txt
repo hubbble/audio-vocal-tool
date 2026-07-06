@@ -12,3 +12,6 @@ tqdm>=4.66.0
 
 # 拖放式 GUI（gui.py 用；沒裝也能用按鈕加入檔案）
 tkinterdnd2>=0.4.0
+
+# 分離不同說話人（speakers 功能用；需 Hugging Face token，見 README）
+pyannote.audio>=4.0

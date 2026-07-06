@@ -12,6 +12,7 @@
   6. cut     : 剪輯，把自選的時間片段剪掉
   7. split   : 把音檔分割成多段（依秒數或等分）
   8. normalize : 音量標準化（LUFS 響度 或 峰值）
+  9. speakers  : 分離不同說話人（pyannote 語者分離，需 Hugging Face token）
 
 也提供 pipeline，一次跑完「分離人聲 → 去靜音」整套流程。
 
@@ -662,7 +663,204 @@ def normalize_audio(
 
 
 # --------------------------------------------------------------------------- #
-# 功能 8：批次處理整個資料夾
+# 功能 8：分離不同說話人（語者分離）
+# --------------------------------------------------------------------------- #
+_HF_HELP = (
+    "分離說話人需要 Hugging Face token（免費）：\n"
+    "  1. 到 https://huggingface.co 註冊帳號\n"
+    "  2. 分別到下面兩頁按「Agree and access repository」接受條款：\n"
+    "       https://huggingface.co/pyannote/speaker-diarization-3.1\n"
+    "       https://huggingface.co/pyannote/segmentation-3.0\n"
+    "  3. 到 https://huggingface.co/settings/tokens 建立 Read token\n"
+    "  4. 把 token 存成本專案資料夾裡的 .hf_token 檔（純文字一行），\n"
+    "     或設定環境變數 HF_TOKEN，或用 --token 參數傳入。"
+)
+
+
+def _hf_token(explicit: str = "") -> str:
+    """依序找 HF token：--token 參數 > 環境變數 > .hf_token 檔。"""
+    if explicit:
+        return explicit
+    for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if os.environ.get(var):
+            return os.environ[var]
+    f = Path(__file__).resolve().parent / ".hf_token"
+    if f.is_file():
+        return f.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def _subtract_intervals(base, cuts):
+    """從 base 區間清單中扣掉 cuts 區間（毫秒整數），回傳剩餘片段。"""
+    out = []
+    for s, e in base:
+        pieces = [(s, e)]
+        for cs, ce in cuts:
+            nxt = []
+            for ps, pe in pieces:
+                if ce <= ps or cs >= pe:
+                    nxt.append((ps, pe))
+                    continue
+                if cs > ps:
+                    nxt.append((ps, cs))
+                if ce < pe:
+                    nxt.append((ce, pe))
+            pieces = nxt
+        out.extend(pieces)
+    return out
+
+
+def _merge_intervals(ivs):
+    """合併重疊的 (start, end) 區間清單。"""
+    merged = []
+    for s, e in sorted(ivs):
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def separate_speakers(
+    input_path: str,
+    output_dir: str,
+    num_speakers: int = 2,
+    device: str = "auto",
+    token: str = "",
+    keep_overlap: bool = False,
+    min_segment: int = 200,
+    bitrate: str = "320k",
+) -> list[str]:
+    """
+    用 pyannote 語者分離，把不同說話人的段落切開，各自輸出成一個音檔。
+
+    參數：
+      num_speakers : 說話人數（0 = 自動偵測）
+      keep_overlap : 預設 False = 兩人同時說話的重疊片段直接捨棄
+      min_segment  : 短於這個毫秒數的碎片不輸出（預設 200ms）
+    """
+    AudioSegment, _ = _import_pydub()
+    _check_ffmpeg()
+
+    in_path = Path(input_path)
+    if not in_path.is_file():
+        sys.exit(f"錯誤：找不到輸入檔 {in_path}")
+
+    tok = _hf_token(token)
+    if not tok:
+        sys.exit("錯誤：找不到 Hugging Face token。\n\n" + _HF_HELP)
+
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            # pyannote 匯入時會對 torchcodec 不可用發出長篇警告；
+            # 我們用 pydub 解碼、以 waveform dict 傳入，不需要 torchcodec。
+            warnings.simplefilter("ignore")
+            import torch
+            from pyannote.audio import Pipeline
+    except ImportError:
+        sys.exit("錯誤：缺少 pyannote.audio。請執行：\n"
+                 "  .venv312\\Scripts\\python.exe -m pip install pyannote.audio")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _info("載入 pyannote 語者分離模型（第一次會下載，請稍候）…")
+    try:
+        pipe = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", token=tok)
+    except TypeError:
+        # 舊版 pyannote 用 use_auth_token 參數
+        pipe = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", use_auth_token=tok)
+    except Exception as e:
+        sys.exit(f"錯誤：模型載入失敗：{e}\n\n"
+                 f"最常見原因是還沒接受模型使用條款或 token 無效。\n\n{_HF_HELP}")
+    if pipe is None:
+        sys.exit("錯誤：模型載入失敗（回傳 None），通常是還沒在 Hugging Face "
+                 "頁面接受使用條款。\n\n" + _HF_HELP)
+
+    dev = detect_device(device)
+    pipe.to(torch.device(dev))
+
+    _info(f"讀取並解碼 {in_path.name} …")
+    audio = AudioSegment.from_file(in_path)
+    total_ms = len(audio)
+    # pyannote 吃 16kHz 單聲道；用 pydub 解碼再轉 tensor，
+    # 完全繞過 torchaudio/torchcodec（在 ROCm 環境不可用）
+    mono16 = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+    waveform = torch.frombuffer(
+        bytearray(mono16.raw_data), dtype=torch.int16
+    ).float().unsqueeze(0) / 32768.0
+
+    _info("分析說話人（這步最花時間）…")
+
+    def hook(name, *args, total=None, completed=None, **kwargs):
+        if total:
+            print(f"\r{name} {completed / total * 100:.0f}%",
+                  end="", flush=True)
+
+    kw = {"hook": hook}
+    if num_speakers and num_speakers > 0:
+        kw["num_speakers"] = num_speakers
+    diar = pipe({"waveform": waveform, "sample_rate": 16000}, **kw)
+    print(flush=True)
+
+    # 整理成 說話人 -> [(start_ms, end_ms)]
+    by_spk: dict[str, list] = {}
+    for turn, _track, label in diar.itertracks(yield_label=True):
+        s = max(0, int(turn.start * 1000))
+        e = min(total_ms, int(turn.end * 1000))
+        if e > s:
+            by_spk.setdefault(label, []).append((s, e))
+    if not by_spk:
+        sys.exit("錯誤：沒有偵測到任何說話人。")
+
+    labels = sorted(by_spk)
+    _info(f"偵測到 {len(labels)} 位說話人。")
+
+    # 找出「兩人以上同時說話」的重疊區，預設直接捨棄
+    overlaps = []
+    for i, a in enumerate(labels):
+        for b in labels[i + 1:]:
+            for s1, e1 in by_spk[a]:
+                for s2, e2 in by_spk[b]:
+                    s, e = max(s1, s2), min(e1, e2)
+                    if e > s:
+                        overlaps.append((s, e))
+    overlaps = _merge_intervals(overlaps)
+    overlap_ms = sum(e - s for s, e in overlaps)
+    if overlaps and not keep_overlap:
+        _info(f"重疊片段共 {overlap_ms / 1000:.1f}s，依設定捨棄。")
+
+    ext = in_path.suffix.lower()
+    if ext not in SUPPORTED_OUT_EXTS:
+        ext = ".mp3"
+
+    outputs = []
+    for i, label in enumerate(labels, 1):
+        segs = _merge_intervals(by_spk[label])
+        if overlaps and not keep_overlap:
+            segs = _subtract_intervals(segs, overlaps)
+        segs = [(s, e) for s, e in sorted(segs) if e - s >= min_segment]
+        if not segs:
+            _info(f"說話人 {i}（{label}）扣掉重疊後沒有可輸出的片段，跳過。")
+            continue
+        result = AudioSegment.empty()
+        for s, e in segs:
+            result += audio[s:e]
+        out_path = out_dir / f"{in_path.stem}_speaker{i}{ext}"
+        _export_audio(result, out_path, bitrate)
+        _info(f"說話人 {i}（{label}）：{len(segs)} 段，"
+              f"共 {len(result) / 1000:.1f}s → {out_path.name}")
+        outputs.append(str(out_path))
+
+    _info(f"完成！輸出在 {out_dir}")
+    return outputs
+
+
+# --------------------------------------------------------------------------- #
+# 功能 9：批次處理整個資料夾
 # --------------------------------------------------------------------------- #
 def batch_process(
     input_dir: str,
@@ -894,6 +1092,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="peak 模式的目標峰值 dBFS (預設 -1.0)")
     p_n.add_argument("--bitrate", default="320k", help="有損格式位元率 (預設 320k)")
 
+    # speakers
+    p_k = sub.add_parser("speakers", help="分離不同說話人（需 Hugging Face token）")
+    p_k.add_argument("input", help="輸入音檔")
+    p_k.add_argument("-o", "--output", required=True, help="輸出資料夾")
+    p_k.add_argument("--speakers", type=int, default=2,
+                     help="說話人數，0 = 自動偵測 (預設 2)")
+    p_k.add_argument("-d", "--device", default="auto",
+                     choices=["auto", "cuda", "cpu"], help="運算裝置")
+    p_k.add_argument("--token", default="",
+                     help="Hugging Face token（也可用 HF_TOKEN 環境變數或 .hf_token 檔）")
+    p_k.add_argument("--keep-overlap", action="store_true",
+                     help="保留兩人同時說話的重疊片段（預設捨棄）")
+    p_k.add_argument("--min-segment", type=int, default=200,
+                     help="短於這個毫秒數的碎片不輸出 (預設 200)")
+    p_k.add_argument("--bitrate", default="320k", help="有損格式位元率 (預設 320k)")
+
     # gpu
     sub.add_parser("gpu", help="檢查 GPU / PyTorch 是否可用")
 
@@ -931,6 +1145,11 @@ def main(argv=None) -> None:
         normalize_audio(args.input, args.output, mode=args.mode,
                         lufs=args.lufs, tp=args.tp,
                         peak_dbfs=args.peak_dbfs, bitrate=args.bitrate)
+    elif args.command == "speakers":
+        separate_speakers(args.input, args.output,
+                          num_speakers=args.speakers, device=args.device,
+                          token=args.token, keep_overlap=args.keep_overlap,
+                          min_segment=args.min_segment, bitrate=args.bitrate)
     elif args.command == "split":
         split_audio(args.input, args.output, seconds=args.seconds,
                     parts=args.parts, fmt=args.fmt, bitrate=args.bitrate)

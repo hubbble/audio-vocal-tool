@@ -106,6 +106,15 @@ I18N = {
         "msg_bad_seg_t": "參數錯誤",
         "msg_bad_seg": "每段長度請輸入數字（分鐘）。",
         "msg_done_t": "完成",
+        "spk_count": "說話人數（0=自動）",
+        "msg_no_token_t": "需要 Hugging Face token",
+        "msg_no_token": "分離說話人需要免費的 Hugging Face token：\n\n"
+                        "1. 到 huggingface.co 註冊帳號\n"
+                        "2. 到 pyannote/speaker-diarization-3.1 與\n"
+                        "    pyannote/segmentation-3.0 兩個模型頁面接受條款\n"
+                        "3. 到 Settings → Access Tokens 建立 Read token\n"
+                        "4. 把 token 存成本資料夾裡的 .hf_token 檔\n"
+                        "    （純文字、一行），再重新執行即可。",
         "dlg_media": "媒體檔",
         "dlg_all": "所有檔案",
         "dlg_pick_files": "選擇音訊 / 影片檔",
@@ -114,6 +123,7 @@ I18N = {
         "dlg_pick_outdir": "選擇輸出資料夾",
         "op_pipeline": "人聲分離 ＋ 去靜音",
         "op_vocals": "人聲分離",
+        "op_speakers": "分離不同說話人",
         "op_trim": "去除靜音",
         "op_cut": "剪輯（自選片段移除）",
         "op_normalize": "音量標準化",
@@ -202,6 +212,16 @@ I18N = {
         "msg_bad_seg_t": "Invalid Parameter",
         "msg_bad_seg": "Segment length must be a number (minutes).",
         "msg_done_t": "Done",
+        "spk_count": "Speakers (0=auto)",
+        "msg_no_token_t": "Hugging Face Token Required",
+        "msg_no_token": "Speaker separation needs a free Hugging Face token:\n\n"
+                        "1. Sign up at huggingface.co\n"
+                        "2. Accept the terms on the model pages\n"
+                        "    pyannote/speaker-diarization-3.1 and\n"
+                        "    pyannote/segmentation-3.0\n"
+                        "3. Create a Read token in Settings → Access Tokens\n"
+                        "4. Save it as a .hf_token file (plain text, one line)\n"
+                        "    in this folder, then run again.",
         "dlg_media": "Media files",
         "dlg_all": "All files",
         "dlg_pick_files": "Select audio / video files",
@@ -210,6 +230,7 @@ I18N = {
         "dlg_pick_outdir": "Select output folder",
         "op_pipeline": "Isolate Vocals + Trim Silence",
         "op_vocals": "Isolate Vocals",
+        "op_speakers": "Separate Speakers",
         "op_trim": "Trim Silence",
         "op_cut": "Cut (remove selected parts)",
         "op_normalize": "Normalize Volume",
@@ -283,10 +304,17 @@ def save_lang(lang: str) -> None:
 
 
 # 操作定義：代碼順序；輸出成單一檔案的操作；用到 GPU 的操作
-OP_ORDER = ["pipeline", "vocals", "trim", "cut", "normalize",
+OP_ORDER = ["pipeline", "vocals", "speakers", "trim", "cut", "normalize",
             "convert", "split", "extract", "merge"]
 OP_FILE_OUT = {"merge"}
-OP_GPU = {"pipeline", "vocals"}
+OP_GPU = {"pipeline", "vocals", "speakers"}
+
+
+def has_hf_token() -> bool:
+    """檢查是否已設定 Hugging Face token（speakers 功能需要）。"""
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
+        return True
+    return (HERE / ".hf_token").is_file()
 
 # 標準化預設：代碼 -> 附加的 CLI 參數
 NORM_ORDER = ["s14", "g16", "b23", "peak"]
@@ -503,6 +531,12 @@ class App:
         self.seg_spin = ttk.Spinbox(grid, textvariable=self.seg_var,
                                     from_=1, to=999, width=6)
 
+        # 分離說話人專用參數
+        self.spk_lbl = ttk.Label(grid, text=T("spk_count"), style="Sub.TLabel")
+        self.spk_var = tk.StringVar(value="2")
+        self.spk_spin = ttk.Spinbox(grid, textvariable=self.spk_var,
+                                    from_=0, to=10, width=6)
+
         # 標準化專用參數
         norm_labels = [T("norm_" + c) for c in NORM_ORDER]
         self._norm_by_label = dict(zip(norm_labels, NORM_ORDER))
@@ -629,7 +663,8 @@ class App:
         self.dev_menu.config(state="readonly" if op in OP_GPU else "disabled")
 
         for w in (self.fmt_lbl, self.fmt_menu, self.br_lbl, self.br_menu,
-                  self.seg_lbl, self.seg_spin, self.norm_lbl, self.norm_menu):
+                  self.seg_lbl, self.seg_spin, self.norm_lbl, self.norm_menu,
+                  self.spk_lbl, self.spk_spin):
             w.grid_forget()
         if op == "convert":
             self.fmt_lbl.grid(row=0, column=2, sticky="w")
@@ -642,6 +677,9 @@ class App:
         elif op == "normalize":
             self.norm_lbl.grid(row=0, column=2, sticky="w")
             self.norm_menu.grid(row=1, column=2, sticky="w")
+        elif op == "speakers":
+            self.spk_lbl.grid(row=0, column=2, sticky="w")
+            self.spk_spin.grid(row=1, column=2, sticky="w")
 
     # ------------------------------------------------------------- 檔案操作
     def _on_drop(self, event):
@@ -718,6 +756,11 @@ class App:
             messagebox.showwarning(T("msg_no_out_t"), T("msg_no_out"))
             return
 
+        # 分離說話人需要 Hugging Face token，先檢查並給說明
+        if op == "speakers" and not has_hf_token():
+            messagebox.showwarning(T("msg_no_token_t"), T("msg_no_token"))
+            return
+
         # 剪輯是互動式操作：開波形編輯視窗，輸出由編輯器觸發
         if op == "cut":
             Path(out).mkdir(parents=True, exist_ok=True)
@@ -765,6 +808,13 @@ class App:
                                         "--seconds", str(secs)])
                 elif op == "vocals":
                     cmds.append(base + ["vocals", f, "-o", out, "-d", dev])
+                elif op == "speakers":
+                    try:
+                        n_spk = max(0, int(self.spk_var.get()))
+                    except ValueError:
+                        n_spk = 2
+                    cmds.append(base + ["speakers", f, "-o", out,
+                                        "--speakers", str(n_spk), "-d", dev])
                 elif op == "trim":
                     cmds.append(base + ["trim", f, "-o",
                                         str(Path(out) / (stem + "_clean.mp3"))])

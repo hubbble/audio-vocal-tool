@@ -27,6 +27,9 @@ output/
 # 使用者個人設定（GUI 語言等）
 gui_settings.json
 
+# Hugging Face token（私密，絕不上傳）
+.hf_token
+
 # 系統檔
 Thumbs.db
 .DS_Store
