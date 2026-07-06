@@ -799,10 +799,31 @@ def separate_speakers(
             print(f"\r{name} {completed / total * 100:.0f}%",
                   end="", flush=True)
 
-    kw = {"hook": hook}
-    if num_speakers and num_speakers > 0:
-        kw["num_speakers"] = num_speakers
-    result = pipe({"waveform": waveform, "sample_rate": 16000}, **kw)
+    def _run_diar():
+        kw = {"hook": hook}
+        if num_speakers and num_speakers > 0:
+            kw["num_speakers"] = num_speakers
+        return pipe({"waveform": waveform, "sample_rate": 16000}, **kw)
+
+    try:
+        result = _run_diar()
+    except RuntimeError as e:
+        # ROCm on Windows 的 MIOpen 對 InstanceNorm 有已知 bug
+        # (miopenStatusUnknownError)，先停用 MIOpen 用 PyTorch 原生
+        # 核心重試（仍走 GPU），不行再退回 CPU。
+        if dev != "cuda" or "miopen" not in str(e).lower():
+            raise
+        print(flush=True)
+        _info("GPU 的 MIOpen 出錯（ROCm on Windows 已知問題），"
+              "停用 MIOpen 後重試…")
+        torch.backends.cudnn.enabled = False
+        try:
+            result = _run_diar()
+        except RuntimeError:
+            print(flush=True)
+            _info("GPU 仍然失敗，改用 CPU 重跑（較慢但穩定）…")
+            pipe.to(torch.device("cpu"))
+            result = _run_diar()
     print(flush=True)
     # pyannote 4.x 回傳 DiarizeOutput 物件，3.x 直接回傳 Annotation
     diar = getattr(result, "speaker_diarization", result)
