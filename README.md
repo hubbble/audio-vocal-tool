@@ -187,9 +187,8 @@ py audio_tool.py speakers 訪談.mp3 -o out/
 **首次使用需要免費的 Hugging Face token**：
 
 1. 到 <https://huggingface.co> 註冊帳號
-2. 到 [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) 和
-   [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-   兩個模型頁面按「Agree and access repository」
+2. 到 [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+   模型頁面按「Agree and access repository」
 3. 到 [Settings → Access Tokens](https://huggingface.co/settings/tokens) 建立 **Read** token
 4. 把 token 存成專案資料夾裡的 `.hf_token` 檔（純文字一行；已被 gitignore，不會外洩）
 

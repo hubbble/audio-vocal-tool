@@ -110,8 +110,8 @@ I18N = {
         "msg_no_token_t": "需要 Hugging Face token",
         "msg_no_token": "分離說話人需要免費的 Hugging Face token：\n\n"
                         "1. 到 huggingface.co 註冊帳號\n"
-                        "2. 到 pyannote/speaker-diarization-3.1 與\n"
-                        "    pyannote/segmentation-3.0 兩個模型頁面接受條款\n"
+                        "2. 到 pyannote/speaker-diarization-community-1\n"
+                        "    模型頁面接受條款\n"
                         "3. 到 Settings → Access Tokens 建立 Read token\n"
                         "4. 把 token 存成本資料夾裡的 .hf_token 檔\n"
                         "    （純文字、一行），再重新執行即可。",
@@ -216,9 +216,8 @@ I18N = {
         "msg_no_token_t": "Hugging Face Token Required",
         "msg_no_token": "Speaker separation needs a free Hugging Face token:\n\n"
                         "1. Sign up at huggingface.co\n"
-                        "2. Accept the terms on the model pages\n"
-                        "    pyannote/speaker-diarization-3.1 and\n"
-                        "    pyannote/segmentation-3.0\n"
+                        "2. Accept the terms on the model page\n"
+                        "    pyannote/speaker-diarization-community-1\n"
                         "3. Create a Read token in Settings → Access Tokens\n"
                         "4. Save it as a .hf_token file (plain text, one line)\n"
                         "    in this folder, then run again.",

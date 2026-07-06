@@ -665,12 +665,13 @@ def normalize_audio(
 # --------------------------------------------------------------------------- #
 # 功能 8：分離不同說話人（語者分離）
 # --------------------------------------------------------------------------- #
+_DIAR_MODEL = "pyannote/speaker-diarization-community-1"
+
 _HF_HELP = (
     "分離說話人需要 Hugging Face token（免費）：\n"
     "  1. 到 https://huggingface.co 註冊帳號\n"
-    "  2. 分別到下面兩頁按「Agree and access repository」接受條款：\n"
-    "       https://huggingface.co/pyannote/speaker-diarization-3.1\n"
-    "       https://huggingface.co/pyannote/segmentation-3.0\n"
+    "  2. 到下面模型頁按「Agree and access repository」接受條款：\n"
+    f"       https://huggingface.co/{_DIAR_MODEL}\n"
     "  3. 到 https://huggingface.co/settings/tokens 建立 Read token\n"
     "  4. 把 token 存成本專案資料夾裡的 .hf_token 檔（純文字一行），\n"
     "     或設定環境變數 HF_TOKEN，或用 --token 參數傳入。"
@@ -767,12 +768,10 @@ def separate_speakers(
 
     _info("載入 pyannote 語者分離模型（第一次會下載，請稍候）…")
     try:
-        pipe = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", token=tok)
+        pipe = Pipeline.from_pretrained(_DIAR_MODEL, token=tok)
     except TypeError:
         # 舊版 pyannote 用 use_auth_token 參數
-        pipe = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", use_auth_token=tok)
+        pipe = Pipeline.from_pretrained(_DIAR_MODEL, use_auth_token=tok)
     except Exception as e:
         sys.exit(f"錯誤：模型載入失敗：{e}\n\n"
                  f"最常見原因是還沒接受模型使用條款或 token 無效。\n\n{_HF_HELP}")
@@ -803,8 +802,10 @@ def separate_speakers(
     kw = {"hook": hook}
     if num_speakers and num_speakers > 0:
         kw["num_speakers"] = num_speakers
-    diar = pipe({"waveform": waveform, "sample_rate": 16000}, **kw)
+    result = pipe({"waveform": waveform, "sample_rate": 16000}, **kw)
     print(flush=True)
+    # pyannote 4.x 回傳 DiarizeOutput 物件，3.x 直接回傳 Annotation
+    diar = getattr(result, "speaker_diarization", result)
 
     # 整理成 說話人 -> [(start_ms, end_ms)]
     by_spk: dict[str, list] = {}
