@@ -3,10 +3,15 @@
 """
 音訊處理工具 (audio_tool)
 
-三大功能：
+功能：
   1. vocals  : 把人聲乾淨地分離出來，去除背景雜音與音樂 (使用 Demucs)
   2. trim    : 去除音檔中無聲 / 空白的片段
   3. merge   : 把多個音檔合併成一個，輸出成 MP3
+  4. extract : 從影片抽出聲音
+  5. convert : 音訊轉檔 (mp3/wav/flac/m4a/ogg/opus)
+  6. cut     : 剪輯，把自選的時間片段剪掉
+  7. split   : 把音檔分割成多段（依秒數或等分）
+  8. normalize : 音量標準化（LUFS 響度 或 峰值）
 
 也提供 pipeline，一次跑完「分離人聲 → 去靜音」整套流程。
 
@@ -14,6 +19,8 @@
   py audio_tool.py vocals  input.mp3 -o out/
   py audio_tool.py trim    input.wav -o clean.mp3
   py audio_tool.py merge   a.mp3 b.mp3 c.wav -o final.mp3
+  py audio_tool.py convert input.wav -o output.mp3
+  py audio_tool.py split   input.mp3 -o parts/ --seconds 300
   py audio_tool.py pipeline input.mp3 -o vocals_clean.mp3
 
 需求：
@@ -23,7 +30,9 @@
 """
 
 import argparse
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,6 +88,90 @@ def _python_exe() -> str:
 
 # Windows 下避免每個子程序彈出黑窗
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+# 各輸出格式對應的 ffmpeg 編碼參數（bitrate 只對有損格式有意義）
+def _codec_args(ext: str, bitrate: str = "320k") -> list[str]:
+    table = {
+        ".mp3":  ["-c:a", "libmp3lame", "-b:a", bitrate],
+        ".wav":  ["-c:a", "pcm_s16le"],
+        ".flac": ["-c:a", "flac"],
+        ".m4a":  ["-c:a", "aac", "-b:a", bitrate],
+        ".aac":  ["-c:a", "aac", "-b:a", bitrate],
+        ".ogg":  ["-c:a", "libvorbis", "-b:a", bitrate],
+        ".opus": ["-c:a", "libopus", "-b:a", "128k"],
+    }
+    return table.get(ext)
+
+
+SUPPORTED_OUT_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus")
+
+
+def _media_duration(path) -> float:
+    """用 ffprobe 取得媒體長度（秒），失敗回傳 0。"""
+    if shutil.which("ffprobe") is None:
+        return 0.0
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, creationflags=_NO_WINDOW)
+    try:
+        return float(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _parse_time(s: str) -> float:
+    """把 '90'、'1:30'、'0:01:30.5' 這類時間字串轉成秒數。"""
+    s = s.strip()
+    try:
+        parts = [float(p) for p in s.split(":")]
+    except ValueError:
+        sys.exit(f"錯誤：看不懂的時間格式 {s!r}（可用 90、1:30、0:01:30.5）")
+    if not 1 <= len(parts) <= 3:
+        sys.exit(f"錯誤：看不懂的時間格式 {s!r}")
+    sec = 0.0
+    for p in parts:
+        sec = sec * 60 + p
+    return sec
+
+
+def _parse_ranges(specs: list[str], total_ms: int) -> list[list[int]]:
+    """把 '1:00-2:30' 之類的片段字串解析成毫秒區間，排序並合併重疊。"""
+    ranges = []
+    for spec in specs:
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" not in part:
+                sys.exit(f"錯誤：片段格式應為 開始-結束（例如 1:00-2:30），"
+                         f"收到 {part!r}")
+            a, b = part.split("-", 1)
+            s = int(_parse_time(a) * 1000)
+            e = int(_parse_time(b) * 1000)
+            if e <= s:
+                sys.exit(f"錯誤：{part} 的結束時間必須大於開始時間。")
+            s, e = max(0, s), min(e, total_ms)
+            if e > s:
+                ranges.append([s, e])
+    ranges.sort()
+    merged = []
+    for s, e in ranges:
+        if merged and s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def _export_audio(seg, out_path: Path, bitrate: str = "320k") -> None:
+    """用 pydub 輸出音檔，格式由副檔名決定（處理 m4a/aac 的 muxer 名稱）。"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ext = out_path.suffix.lstrip(".").lower() or "mp3"
+    fmt = {"m4a": "ipod", "aac": "adts"}.get(ext, ext)
+    kwargs = {"bitrate": bitrate} if ext in ("mp3", "m4a", "aac", "ogg") else {}
+    seg.export(out_path, format=fmt, **kwargs)
 
 
 def detect_device(prefer: str = "auto") -> str:
@@ -242,12 +335,7 @@ def trim_silence(
           f"(移除約 {removed:.1f}s)")
 
     out_path = Path(output_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fmt = out_path.suffix.lstrip(".").lower() or "mp3"
-    export_kwargs = {}
-    if fmt == "mp3":
-        export_kwargs["bitrate"] = "320k"
-    result.export(out_path, format=fmt, **export_kwargs)
+    _export_audio(result, out_path)
 
     _info(f"完成！輸出：{out_path}")
     return str(out_path)
@@ -284,7 +372,9 @@ def merge_audio(
         if combined is None:
             combined = seg
         else:
-            combined = combined.append(seg, crossfade=crossfade)
+            # crossfade 不能比任一段還長，否則 pydub 會直接丟例外
+            cf = min(crossfade, len(combined), len(seg))
+            combined = combined.append(seg, crossfade=cf)
 
     out_path = Path(output_path)
     if out_path.suffix.lower() != ".mp3":
@@ -299,17 +389,17 @@ def merge_audio(
 
 
 # --------------------------------------------------------------------------- #
-# 功能 4：影片轉音檔
+# 功能 4：音訊轉檔（也可從影片抽出聲音）
 # --------------------------------------------------------------------------- #
-def extract_audio(
+def convert_audio(
     input_path: str,
     output_path: str,
     bitrate: str = "320k",
 ) -> str:
     """
-    從影片（mp4 / mkv / mov…）抽出聲音，輸出成音檔。
+    把任何音檔 / 影片轉成指定的音訊格式，格式由 output_path 副檔名決定。
 
-    輸出格式由 output_path 副檔名決定（.mp3 或 .wav，預設 mp3）。
+    支援輸出：mp3 / wav / flac / m4a / aac / ogg / opus
     """
     _check_ffmpeg()
     in_path = Path(input_path)
@@ -317,30 +407,262 @@ def extract_audio(
         sys.exit(f"錯誤：找不到輸入檔 {in_path}")
 
     out_path = Path(output_path)
-    if out_path.suffix.lower() not in (".mp3", ".wav"):
-        out_path = out_path.with_suffix(".mp3")
+    ext = out_path.suffix.lower()
+    codec = _codec_args(ext, bitrate)
+    if codec is None:
+        sys.exit(f"錯誤：不支援的輸出格式 {ext or '(無副檔名)'}，"
+                 f"支援：{' '.join(SUPPORTED_OUT_EXTS)}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fmt = out_path.suffix.lower()
-    cmd = ["ffmpeg", "-y", "-i", str(in_path), "-vn"]
-    if fmt == ".wav":
-        cmd += ["-acodec", "pcm_s16le"]
-    else:  # mp3
-        cmd += ["-acodec", "libmp3lame", "-b:a", bitrate]
-    cmd += [str(out_path), "-loglevel", "error", "-stats"]
+    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
+            "-i", str(in_path), "-vn"] + codec + [str(out_path)])
 
-    _info(f"從 {in_path.name} 抽取音訊 → {out_path} …")
+    _info(f"轉檔 {in_path.name} → {out_path.name} …")
     result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
                             creationflags=_NO_WINDOW)
     if result.returncode != 0:
-        sys.exit("錯誤：ffmpeg 抽取音訊失敗。")
+        sys.exit("錯誤：ffmpeg 轉檔失敗。")
+
+    _info(f"完成！輸出：{out_path}")
+    return str(out_path)
+
+
+def extract_audio(
+    input_path: str,
+    output_path: str,
+    bitrate: str = "320k",
+) -> str:
+    """從影片（mp4 / mkv / mov…）抽出聲音；副檔名不支援時改輸出 mp3。"""
+    out_path = Path(output_path)
+    if out_path.suffix.lower() not in SUPPORTED_OUT_EXTS:
+        out_path = out_path.with_suffix(".mp3")
+    return convert_audio(input_path, str(out_path), bitrate=bitrate)
+
+
+# --------------------------------------------------------------------------- #
+# 功能 5：剪輯（移除自選片段）
+# --------------------------------------------------------------------------- #
+def cut_audio(
+    input_path: str,
+    output_path: str,
+    remove: list[str],
+) -> str:
+    """
+    把指定的時間片段從音檔中剪掉，其餘部分接起來輸出。
+
+    remove 是片段字串清單，例如 ["0:30-1:00", "2:10-2:45.5"]，
+    時間可用 秒 / 分:秒 / 時:分:秒。重疊的片段會自動合併。
+    """
+    AudioSegment, _ = _import_pydub()
+    _check_ffmpeg()
+
+    in_path = Path(input_path)
+    if not in_path.is_file():
+        sys.exit(f"錯誤：找不到輸入檔 {in_path}")
+
+    _info(f"讀取 {in_path} …")
+    audio = AudioSegment.from_file(in_path)
+    total_ms = len(audio)
+
+    merged = _parse_ranges(remove, total_ms)
+    if not merged:
+        sys.exit("錯誤：--remove 至少要指定一個片段，例如 --remove 1:00-2:30")
+
+    result = AudioSegment.empty()
+    pos = 0
+    for s, e in merged:
+        if s > pos:
+            result += audio[pos:s]
+        pos = e
+    if pos < total_ms:
+        result += audio[pos:total_ms]
+
+    if len(result) == 0:
+        sys.exit("錯誤：全部片段都被剪掉了，沒有東西可輸出。")
+
+    removed_s = (total_ms - len(result)) / 1000.0
+    _info(f"原長 {total_ms/1000:.1f}s，剪掉 {len(merged)} 段共 {removed_s:.1f}s "
+          f"→ 剩 {len(result)/1000:.1f}s")
+
+    out_path = Path(output_path)
+    _export_audio(result, out_path)
+    _info(f"完成！輸出：{out_path}")
+    return str(out_path)
+
+
+# --------------------------------------------------------------------------- #
+# 功能 6：分割音檔
+# --------------------------------------------------------------------------- #
+def split_audio(
+    input_path: str,
+    output_dir: str,
+    seconds: float = 0,
+    parts: int = 0,
+    fmt: str = "",
+    bitrate: str = "320k",
+) -> list[str]:
+    """
+    把音檔切成多段，輸出到資料夾（檔名為 原檔名_000、_001…）。
+
+    參數：
+      seconds : 每段長度（秒）
+      parts   : 或改成「等分成幾段」（需要 ffprobe 取得總長）
+      fmt     : 輸出格式（如 "mp3"），留空 = 與原檔相同
+    """
+    _check_ffmpeg()
+    in_path = Path(input_path)
+    if not in_path.is_file():
+        sys.exit(f"錯誤：找不到輸入檔 {in_path}")
+    if seconds <= 0 and parts <= 0:
+        sys.exit("錯誤：--seconds 或 --parts 至少要指定一個。")
+
+    if parts > 0:
+        duration = _media_duration(in_path)
+        if duration <= 0:
+            sys.exit("錯誤：無法取得音檔長度（需要 ffprobe），請改用 --seconds。")
+        # 加一點餘裕，避免浮點誤差多切出一小段
+        seconds = duration / parts + 0.05
+
+    src_ext = in_path.suffix.lower()
+    ext = "." + fmt.lstrip(".").lower() if fmt else (
+        src_ext if src_ext in SUPPORTED_OUT_EXTS else ".mp3")
+    codec = _codec_args(ext, bitrate)
+    if codec is None:
+        sys.exit(f"錯誤：不支援的輸出格式 {ext}，支援：{' '.join(SUPPORTED_OUT_EXTS)}")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / f"{in_path.stem}_%03d{ext}"
+
+    # 格式不變的話直接串流複製，不重新編碼（快很多、無損）
+    if ext == src_ext:
+        codec = ["-c:a", "copy"]
+
+    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
+            "-i", str(in_path), "-vn"] + codec +
+           ["-f", "segment", "-segment_time", f"{seconds:g}",
+            "-reset_timestamps", "1", str(pattern)])
+
+    _info(f"分割 {in_path.name}（每段 {seconds:.0f} 秒）…")
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                            creationflags=_NO_WINDOW)
+    if result.returncode != 0:
+        sys.exit("錯誤：ffmpeg 分割失敗。")
+
+    outputs = sorted(str(p) for p in out_dir.glob(f"{in_path.stem}_[0-9][0-9][0-9]{ext}"))
+    _info(f"完成！共 {len(outputs)} 段，輸出在 {out_dir}")
+    return outputs
+
+
+# --------------------------------------------------------------------------- #
+# 功能 7：音量標準化
+# --------------------------------------------------------------------------- #
+def _media_sample_rate(path) -> int:
+    """用 ffprobe 取得取樣率，失敗回傳 44100。"""
+    if shutil.which("ffprobe") is None:
+        return 44100
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, creationflags=_NO_WINDOW)
+    try:
+        return int(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return 44100
+
+
+def normalize_audio(
+    input_path: str,
+    output_path: str,
+    mode: str = "lufs",
+    lufs: float = -16.0,
+    tp: float = -1.5,
+    peak_dbfs: float = -1.0,
+    bitrate: str = "320k",
+) -> str:
+    """
+    音量標準化。
+
+    mode = "lufs"：EBU R128 響度標準化（兩段式 loudnorm，較精準），
+                   lufs 是目標響度（串流平台常用 -14，podcast -16，廣播 -23），
+                   tp 是真峰值上限 dBTP。
+    mode = "peak"：簡單峰值標準化，把最大音量拉到 peak_dbfs（快，不改動態）。
+    """
+    _check_ffmpeg()
+    in_path = Path(input_path)
+    if not in_path.is_file():
+        sys.exit(f"錯誤：找不到輸入檔 {in_path}")
+
+    out_path = Path(output_path)
+    ext = out_path.suffix.lower()
+    codec = _codec_args(ext, bitrate)
+    if codec is None:
+        sys.exit(f"錯誤：不支援的輸出格式 {ext or '(無副檔名)'}，"
+                 f"支援：{' '.join(SUPPORTED_OUT_EXTS)}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- 峰值模式：pydub 直接加增益 ---
+    if mode == "peak":
+        AudioSegment, _ = _import_pydub()
+        audio = AudioSegment.from_file(in_path)
+        peak = audio.max_dBFS
+        if peak == float("-inf"):
+            sys.exit("錯誤：整段都是靜音，無法做峰值標準化。")
+        gain = peak_dbfs - peak
+        _info(f"峰值 {peak:.1f} dBFS → 目標 {peak_dbfs:.1f} dBFS"
+              f"（增益 {gain:+.1f} dB）")
+        _export_audio(audio.apply_gain(gain), out_path, bitrate)
+        _info(f"完成！輸出：{out_path}")
+        return str(out_path)
+
+    # --- LUFS 模式：ffmpeg loudnorm 兩段式 ---
+    base_filter = f"loudnorm=I={lufs}:TP={tp}:LRA=11"
+    _info(f"第 1 步：量測響度（目標 {lufs} LUFS）…")
+    measure = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(in_path),
+         "-af", base_filter + ":print_format=json", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW)
+
+    filter_str = base_filter
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", measure.stderr, re.S)
+    if measure.returncode == 0 and m:
+        try:
+            stats = json.loads(m.group(0))
+            _info(f"量測結果：{stats['input_i']} LUFS，"
+                  f"真峰值 {stats['input_tp']} dBTP")
+            filter_str = (
+                base_filter
+                + f":measured_I={stats['input_i']}"
+                + f":measured_TP={stats['input_tp']}"
+                + f":measured_LRA={stats['input_lra']}"
+                + f":measured_thresh={stats['input_thresh']}"
+                + f":offset={stats['target_offset']}"
+                + ":linear=true"
+            )
+        except (json.JSONDecodeError, KeyError):
+            _info("量測結果解析失敗，改用單段式 loudnorm。")
+    else:
+        _info("量測失敗，改用單段式 loudnorm。")
+
+    # loudnorm 內部會升到 192kHz，輸出時降回原取樣率
+    sr = _media_sample_rate(in_path)
+    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
+            "-i", str(in_path), "-vn", "-af", filter_str, "-ar", str(sr)]
+           + codec + [str(out_path)])
+
+    _info("第 2 步：套用標準化並輸出…")
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                            creationflags=_NO_WINDOW)
+    if result.returncode != 0:
+        sys.exit("錯誤：ffmpeg 標準化失敗。")
 
     _info(f"完成！輸出：{out_path}")
     return str(out_path)
 
 
 # --------------------------------------------------------------------------- #
-# 功能 5：批次處理整個資料夾
+# 功能 8：批次處理整個資料夾
 # --------------------------------------------------------------------------- #
 def batch_process(
     input_dir: str,
@@ -513,6 +835,35 @@ def build_parser() -> argparse.ArgumentParser:
                      help="輸出音檔 (.mp3 或 .wav)")
     p_e.add_argument("--bitrate", default="320k", help="MP3 位元率 (預設 320k)")
 
+    # convert
+    p_c = sub.add_parser("convert", help="音訊轉檔 (mp3/wav/flac/m4a/ogg/opus)")
+    p_c.add_argument("input", help="輸入音檔或影片")
+    p_c.add_argument("-o", "--output", required=True,
+                     help="輸出檔，副檔名決定格式 (例如 out.flac)")
+    p_c.add_argument("--bitrate", default="320k", help="有損格式位元率 (預設 320k)")
+
+    # cut
+    p_x = sub.add_parser("cut", help="剪輯：把自選的時間片段剪掉")
+    p_x.add_argument("input", help="輸入音檔")
+    p_x.add_argument("-o", "--output", required=True,
+                     help="輸出檔 (副檔名決定格式，例如 cut.mp3)")
+    p_x.add_argument("--remove", action="append", required=True,
+                     metavar="START-END",
+                     help="要剪掉的片段，可重複指定或用逗號分隔多段，"
+                          "例如 --remove 0:30-1:00 --remove 2:10-2:45.5")
+
+    # split
+    p_s = sub.add_parser("split", help="分割音檔成多段")
+    p_s.add_argument("input", help="輸入音檔")
+    p_s.add_argument("-o", "--output", required=True, help="輸出資料夾")
+    p_s.add_argument("--seconds", type=float, default=0,
+                     help="每段長度（秒）")
+    p_s.add_argument("--parts", type=int, default=0,
+                     help="或等分成幾段（與 --seconds 擇一）")
+    p_s.add_argument("--fmt", default="",
+                     help="輸出格式（如 mp3），預設與原檔相同")
+    p_s.add_argument("--bitrate", default="320k", help="有損格式位元率 (預設 320k)")
+
     # batch
     p_b = sub.add_parser("batch", help="批次處理整個資料夾")
     p_b.add_argument("input_dir", help="輸入資料夾")
@@ -527,6 +878,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_b.add_argument("--silence-thresh", type=int, default=-40)
     p_b.add_argument("--min-silence-len", type=int, default=500)
     p_b.add_argument("-m", "--model", default="htdemucs", help="Demucs 模型")
+
+    # normalize
+    p_n = sub.add_parser("normalize", help="音量標準化（LUFS 響度 或 峰值）")
+    p_n.add_argument("input", help="輸入音檔")
+    p_n.add_argument("-o", "--output", required=True,
+                     help="輸出檔 (副檔名決定格式)")
+    p_n.add_argument("--mode", default="lufs", choices=["lufs", "peak"],
+                     help="lufs=響度標準化(預設) / peak=峰值標準化")
+    p_n.add_argument("--lufs", type=float, default=-16.0,
+                     help="目標響度 LUFS：串流 -14 / 通用 -16 / 廣播 -23 (預設 -16)")
+    p_n.add_argument("--tp", type=float, default=-1.5,
+                     help="真峰值上限 dBTP (預設 -1.5)")
+    p_n.add_argument("--peak-dbfs", type=float, default=-1.0,
+                     help="peak 模式的目標峰值 dBFS (預設 -1.0)")
+    p_n.add_argument("--bitrate", default="320k", help="有損格式位元率 (預設 320k)")
 
     # gpu
     sub.add_parser("gpu", help="檢查 GPU / PyTorch 是否可用")
@@ -557,6 +923,17 @@ def main(argv=None) -> None:
                  device=args.device)
     elif args.command == "extract":
         extract_audio(args.input, args.output, bitrate=args.bitrate)
+    elif args.command == "convert":
+        convert_audio(args.input, args.output, bitrate=args.bitrate)
+    elif args.command == "cut":
+        cut_audio(args.input, args.output, remove=args.remove)
+    elif args.command == "normalize":
+        normalize_audio(args.input, args.output, mode=args.mode,
+                        lufs=args.lufs, tp=args.tp,
+                        peak_dbfs=args.peak_dbfs, bitrate=args.bitrate)
+    elif args.command == "split":
+        split_audio(args.input, args.output, seconds=args.seconds,
+                    parts=args.parts, fmt=args.fmt, bitrate=args.bitrate)
     elif args.command == "batch":
         batch_process(args.input_dir, args.output, op=args.op,
                       device=args.device, recursive=args.recursive,

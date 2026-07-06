@@ -18,9 +18,11 @@ dist/
 音訊處理工具.exe
 *.exe
 
-# 暫存 / 預覽
+# 暫存 / 預覽 / 測試輸出
 _preview.png
 *.log
+output.mp3
+output/
 
 # 系統檔
 Thumbs.db
