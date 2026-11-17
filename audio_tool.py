@@ -38,6 +38,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -166,6 +167,96 @@ def _parse_ranges(specs: list[str], total_ms: int) -> list[list[int]]:
     return merged
 
 
+# --------------------------------------------------------------------------- #
+# 進度回報
+# --------------------------------------------------------------------------- #
+# 終端機：用 \r 原地更新一行。
+# 被 GUI 以管線讀取：輸出「[progress] 45 標籤」整行，GUI 依內容辨識後更新進度條
+# （管線是文字模式，\r 會被轉成換行，所以不能靠 \r 區分進度與一般訊息）。
+PROGRESS_TAG = "[progress]"
+_progress_last = None
+
+
+def _is_tty() -> bool:
+    try:
+        return sys.stdout is not None and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _progress(pct: float, label: str = "") -> None:
+    """回報 0~100 的進度；數值沒變就不重複輸出。"""
+    global _progress_last
+    pct = max(0, min(100, int(pct)))
+    if (pct, label) == _progress_last:
+        return
+    _progress_last = (pct, label)
+    if _is_tty():
+        print(f"\r{label + ' ' if label else ''}{pct:3d}%", end="", flush=True)
+    else:
+        print(f"{PROGRESS_TAG} {pct} {label}".rstrip(), flush=True)
+
+
+def _progress_end() -> None:
+    """一段進度結束：終端機補換行，並重設去重狀態。"""
+    global _progress_last
+    if _progress_last is not None and _is_tty():
+        print(flush=True)
+    _progress_last = None
+
+
+def _run_ffmpeg(args: list[str], duration: float = 0.0, label: str = "",
+                lo: float = 0.0, hi: float = 100.0,
+                capture_stderr: bool = False) -> tuple[int, str]:
+    """
+    執行 ffmpeg 並回報進度。
+
+    args     : 接在 ffmpeg 後面的參數
+    duration : 輸入長度（秒），用來把 ffmpeg 回報的時間換算成百分比；0 = 不顯示
+    lo / hi  : 這次執行對應到整體進度的哪一段（兩段式處理用）
+    回傳 (returncode, stderr 文字)；沒有 capture_stderr 時 stderr 直接顯示。
+    """
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-progress", "pipe:1"] + args
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE if capture_stderr else None,
+        text=True, encoding="utf-8", errors="replace",
+        creationflags=_NO_WINDOW)
+
+    # stderr 要同時讀走，否則內容一多（長篇 metadata）會塞滿管線、兩邊互等
+    err_parts: list[str] = []
+    reader = None
+    if capture_stderr:
+        reader = threading.Thread(
+            target=lambda: err_parts.append(proc.stderr.read()), daemon=True)
+        reader.start()
+
+    for line in proc.stdout:
+        key, _, val = line.strip().partition("=")
+        # out_time_us / out_time_ms 兩個都是微秒（ffmpeg 的歷史包袱）
+        if duration > 0 and key in ("out_time_us", "out_time_ms"):
+            try:
+                sec = int(val) / 1_000_000
+            except ValueError:      # 剛開始會是 N/A
+                continue
+            frac = min(1.0, max(0.0, sec / duration))
+            _progress(lo + (hi - lo) * frac, label)
+    proc.wait()
+    if reader is not None:
+        reader.join()
+    return proc.returncode, "".join(err_parts)
+
+
+def _concat_slices(audio, ranges):
+    """
+    把 audio 的多個 [start_ms, end_ms) 片段依序接起來。
+
+    一次 join 完成；用 `result += audio[s:e]` 逐段累加的話，每次都會把
+    已累積的資料整份複製一遍，片段一多就變得非常慢。
+    """
+    return audio._spawn(b"".join(audio[s:e].raw_data for s, e in ranges))
+
+
 def _export_audio(seg, out_path: Path, bitrate: str = "320k") -> None:
     """用 pydub 輸出音檔，格式由副檔名決定（處理 m4a/aac 的 muxer 名稱）。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,15 +336,18 @@ def separate_vocals(
     _info(f"開始用 Demucs ({model}, device={dev}) 分離人聲，"
           f"第一次會自動下載模型，請稍候…")
 
-    # 注意：torchaudio 2.9 存 WAV 會走 torchcodec，與本機 ffmpeg 8 不相容，
-    # 因此一律讓 Demucs 以 MP3 (lameenc) 輸出；若呼叫端要 WAV，再用 pydub 轉。
+    # 不直接跑「python -m demucs」，而是透過本檔的隱藏入口 _demucs：
+    # torchaudio 2.9 存 WAV/FLAC 會走 torchcodec，與本機 ffmpeg 8 不相容，
+    # 入口會把 Demucs 的存檔函式換成純標準庫的 WAV 寫入（見 _demucs_entry），
+    # 這樣 --wav 才是真正無損，而不是「先存 MP3 再解回 WAV」。
     # --two-stems=vocals 只切出「人聲」與「其餘」兩軌，速度較快也更乾淨
+    fmt_args = (["--mp3", "--mp3-bitrate", "320"] if mp3 else ["--int24"])
     cmd = [
-        _python_exe(), "-m", "demucs",
+        _python_exe(), str(Path(__file__).resolve()), "_demucs",
         "-n", model,
         "--two-stems", "vocals",
         "-d", dev,
-        "--mp3", "--mp3-bitrate", "320",
+        *fmt_args,
         "-o", str(out_dir),
         str(in_path),
     ]
@@ -263,26 +357,70 @@ def separate_vocals(
     if result.returncode != 0:
         sys.exit("錯誤：Demucs 執行失敗，請檢查上方訊息。")
 
-    # Demucs 輸出路徑：<out_dir>/<model>/<檔名>/vocals.mp3
+    # Demucs 輸出路徑：<out_dir>/<model>/<檔名>/vocals.<mp3|wav>
+    ext = "mp3" if mp3 else "wav"
     stem_dir = out_dir / model / in_path.stem
-    vocals_file = stem_dir / "vocals.mp3"
+    vocals_file = stem_dir / f"vocals.{ext}"
     if not vocals_file.is_file():
-        candidates = list(stem_dir.glob("vocals.*"))
-        if candidates:
-            vocals_file = candidates[0]
-        else:
-            sys.exit(f"錯誤：找不到分離後的人聲檔，預期位置 {vocals_file}")
-
-    # 呼叫端要 wav 的話，用 pydub 把 mp3 轉成 wav
-    if not mp3:
-        AudioSegment, _ = _import_pydub()
-        wav_file = stem_dir / "vocals.wav"
-        AudioSegment.from_file(vocals_file).export(wav_file, format="wav")
-        vocals_file = wav_file
+        sys.exit(f"錯誤：找不到分離後的人聲檔，預期位置 {vocals_file}")
 
     _info(f"完成！人聲檔：{vocals_file}")
-    _info(f"伴奏 / 背景檔同目錄 no_vocals.mp3")
+    _info(f"伴奏 / 背景檔同目錄 no_vocals.{ext}")
     return str(vocals_file)
+
+
+def _save_wav_stdlib(wav, path, samplerate, clip="rescale",
+                     bits_per_sample=16, **_ignored) -> None:
+    """用標準庫 wave 把 Demucs 的輸出張量寫成 16/24-bit PCM WAV。"""
+    import wave
+
+    import torch
+    from demucs.audio import prevent_clip
+
+    wav = prevent_clip(wav, mode=clip).detach().cpu().clamp(-1, 1)
+    frames = wav.transpose(0, 1).contiguous()          # (取樣點, 聲道) 交錯排列
+    if bits_per_sample == 24:
+        import numpy as np
+        # 用 float64 算（float32 的精度不夠表示 24-bit 整數），
+        # 轉成小端 int32 後每個取樣只留低位的 3 個位元組。
+        i32 = (frames.double() * (2 ** 23 - 1)).round().to(torch.int32)
+        i32 = i32.numpy().astype("<i4")
+        data = i32.view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+        width = 3
+    else:
+        i16 = (frames * (2 ** 15 - 1)).round().to(torch.int16)
+        data, width = i16.numpy().astype("<i2").tobytes(), 2
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(wav.shape[0])
+        w.setsampwidth(width)
+        w.setframerate(samplerate)
+        w.writeframes(data)
+
+
+def _demucs_entry(argv: list[str]) -> None:
+    """
+    隱藏入口：`audio_tool.py _demucs <demucs 參數…>`。
+
+    等同 `python -m demucs`，但 WAV 改用 _save_wav_stdlib 存檔，
+    繞過 torchaudio.save（在本環境會因 torchcodec 失敗）。MP3 維持 Demucs 原本的
+    lameenc 路徑。
+    """
+    import demucs.separate as sep
+
+    original = sep.save_audio
+
+    def save_audio(wav, path, samplerate, **kwargs):
+        if str(path).lower().endswith(".wav") and not kwargs.get("as_float"):
+            _save_wav_stdlib(wav, path, samplerate, **kwargs)
+        else:
+            original(wav, path, samplerate, **kwargs)
+
+    # separate.py 是用 `from .audio import save_audio` 匯入，要換它自己的那個名字
+    sep.save_audio = save_audio
+    sep.main(argv)
 
 
 # --------------------------------------------------------------------------- #
@@ -314,22 +452,25 @@ def trim_silence(
     audio = AudioSegment.from_file(in_path)
 
     _info("偵測有聲片段…")
+    # seek_step 預設 1ms，是純 Python 逐毫秒計算，長檔會跑很久；
+    # 10ms 一步快約 10 倍，邊界誤差遠小於 keep_padding。
     nonsilent = detect_nonsilent(
         audio,
         min_silence_len=min_silence_len,
         silence_thresh=silence_thresh,
+        seek_step=10,
     )
 
     if not nonsilent:
-        sys.exit("警告：整段都被判定為靜音，請調高 --silence-thresh (例如 -50)。")
+        sys.exit("警告：整段都被判定為靜音，請調低 --silence-thresh (例如 -50)。")
 
-    # 把所有有聲片段(含 padding)接起來
-    result = AudioSegment.empty()
+    # 每段前後加 padding；padding 大到相鄰片段互相重疊時要先合併，
+    # 否則重疊的部分會被輸出兩次。
     total_ms = len(audio)
-    for start, end in nonsilent:
-        s = max(0, start - keep_padding)
-        e = min(total_ms, end + keep_padding)
-        result += audio[s:e]
+    keep = _merge_intervals(
+        (max(0, start - keep_padding), min(total_ms, end + keep_padding))
+        for start, end in nonsilent)
+    result = _concat_slices(audio, keep)
 
     removed = (total_ms - len(result)) / 1000.0
     _info(f"原長 {total_ms/1000:.1f}s → 去靜音後 {len(result)/1000:.1f}s "
@@ -378,7 +519,10 @@ def merge_audio(
             combined = combined.append(seg, crossfade=cf)
 
     out_path = Path(output_path)
-    if out_path.suffix.lower() != ".mp3":
+    if out_path.is_dir():
+        # -o 給的是資料夾：把檔案放進去，而不是在旁邊生出「資料夾名.mp3」
+        out_path = out_path / "merged.mp3"
+    elif out_path.suffix.lower() != ".mp3":
         out_path = out_path.with_suffix(".mp3")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -415,13 +559,13 @@ def convert_audio(
                  f"支援：{' '.join(SUPPORTED_OUT_EXTS)}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
-            "-i", str(in_path), "-vn"] + codec + [str(out_path)])
-
     _info(f"轉檔 {in_path.name} → {out_path.name} …")
-    result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
-                            creationflags=_NO_WINDOW)
-    if result.returncode != 0:
+    rc, _ = _run_ffmpeg(
+        ["-y", "-loglevel", "error", "-i", str(in_path), "-vn"]
+        + codec + [str(out_path)],
+        duration=_media_duration(in_path))
+    _progress_end()
+    if rc != 0:
         sys.exit("錯誤：ffmpeg 轉檔失敗。")
 
     _info(f"完成！輸出：{out_path}")
@@ -469,17 +613,18 @@ def cut_audio(
     if not merged:
         sys.exit("錯誤：--remove 至少要指定一個片段，例如 --remove 1:00-2:30")
 
-    result = AudioSegment.empty()
+    keep = []
     pos = 0
     for s, e in merged:
         if s > pos:
-            result += audio[pos:s]
+            keep.append((pos, s))
         pos = e
     if pos < total_ms:
-        result += audio[pos:total_ms]
+        keep.append((pos, total_ms))
 
-    if len(result) == 0:
+    if not keep:
         sys.exit("錯誤：全部片段都被剪掉了，沒有東西可輸出。")
+    result = _concat_slices(audio, keep)
 
     removed_s = (total_ms - len(result)) / 1000.0
     _info(f"原長 {total_ms/1000:.1f}s，剪掉 {len(merged)} 段共 {removed_s:.1f}s "
@@ -517,8 +662,8 @@ def split_audio(
     if seconds <= 0 and parts <= 0:
         sys.exit("錯誤：--seconds 或 --parts 至少要指定一個。")
 
+    duration = _media_duration(in_path)
     if parts > 0:
-        duration = _media_duration(in_path)
         if duration <= 0:
             sys.exit("錯誤：無法取得音檔長度（需要 ffprobe），請改用 --seconds。")
         # 加一點餘裕，避免浮點誤差多切出一小段
@@ -539,15 +684,14 @@ def split_audio(
     if ext == src_ext:
         codec = ["-c:a", "copy"]
 
-    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
-            "-i", str(in_path), "-vn"] + codec +
-           ["-f", "segment", "-segment_time", f"{seconds:g}",
-            "-reset_timestamps", "1", str(pattern)])
-
     _info(f"分割 {in_path.name}（每段 {seconds:.0f} 秒）…")
-    result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
-                            creationflags=_NO_WINDOW)
-    if result.returncode != 0:
+    rc, _ = _run_ffmpeg(
+        ["-y", "-loglevel", "error", "-i", str(in_path), "-vn"] + codec
+        + ["-f", "segment", "-segment_time", f"{seconds:g}",
+           "-reset_timestamps", "1", str(pattern)],
+        duration=duration)
+    _progress_end()
+    if rc != 0:
         sys.exit("錯誤：ffmpeg 分割失敗。")
 
     outputs = sorted(str(p) for p in out_dir.glob(f"{in_path.stem}_[0-9][0-9][0-9]{ext}"))
@@ -618,16 +762,17 @@ def normalize_audio(
 
     # --- LUFS 模式：ffmpeg loudnorm 兩段式 ---
     base_filter = f"loudnorm=I={lufs}:TP={tp}:LRA=11"
+    duration = _media_duration(in_path)
     _info(f"第 1 步：量測響度（目標 {lufs} LUFS）…")
-    measure = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(in_path),
+    # 兩段各佔進度條的一半
+    measure_rc, measure_err = _run_ffmpeg(
+        ["-i", str(in_path), "-vn",
          "-af", base_filter + ":print_format=json", "-f", "null", "-"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=_NO_WINDOW)
+        duration=duration, lo=0, hi=50, capture_stderr=True)
 
     filter_str = base_filter
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", measure.stderr, re.S)
-    if measure.returncode == 0 and m:
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", measure_err, re.S)
+    if measure_rc == 0 and m:
         try:
             stats = json.loads(m.group(0))
             _info(f"量測結果：{stats['input_i']} LUFS，"
@@ -648,14 +793,13 @@ def normalize_audio(
 
     # loudnorm 內部會升到 192kHz，輸出時降回原取樣率
     sr = _media_sample_rate(in_path)
-    cmd = (["ffmpeg", "-y", "-loglevel", "error", "-stats",
-            "-i", str(in_path), "-vn", "-af", filter_str, "-ar", str(sr)]
-           + codec + [str(out_path)])
-
     _info("第 2 步：套用標準化並輸出…")
-    result = subprocess.run(cmd, stdin=subprocess.DEVNULL,
-                            creationflags=_NO_WINDOW)
-    if result.returncode != 0:
+    rc, _ = _run_ffmpeg(
+        ["-y", "-loglevel", "error", "-i", str(in_path), "-vn",
+         "-af", filter_str, "-ar", str(sr)] + codec + [str(out_path)],
+        duration=duration, lo=50, hi=100)
+    _progress_end()
+    if rc != 0:
         sys.exit("錯誤：ffmpeg 標準化失敗。")
 
     _info(f"完成！輸出：{out_path}")
@@ -794,10 +938,18 @@ def separate_speakers(
 
     _info("分析說話人（這步最花時間）…")
 
+    # pyannote 會分幾個步驟各自從 0 跑到 100%；對應到整體進度的不同區段，
+    # 進度條才不會來回跳。沒列到的步驟很短、也不回報 total。
+    spans = {"segmentation": (0, 25), "embeddings": (25, 95)}
+    reached = [0.0]
+
     def hook(name, *args, total=None, completed=None, **kwargs):
-        if total:
-            print(f"\r{name} {completed / total * 100:.0f}%",
-                  end="", flush=True)
+        if not total or name not in spans:
+            return
+        lo, hi = spans[name]
+        pct = lo + (hi - lo) * min(1.0, completed / total)
+        reached[0] = max(reached[0], pct)      # GPU 失敗重跑時不倒退
+        _progress(reached[0], name)
 
     def _run_diar():
         kw = {"hook": hook}
@@ -813,18 +965,18 @@ def separate_speakers(
         # 核心重試（仍走 GPU），不行再退回 CPU。
         if dev != "cuda" or "miopen" not in str(e).lower():
             raise
-        print(flush=True)
+        _progress_end()
         _info("GPU 的 MIOpen 出錯（ROCm on Windows 已知問題），"
               "停用 MIOpen 後重試…")
         torch.backends.cudnn.enabled = False
         try:
             result = _run_diar()
         except RuntimeError:
-            print(flush=True)
+            _progress_end()
             _info("GPU 仍然失敗，改用 CPU 重跑（較慢但穩定）…")
             pipe.to(torch.device("cpu"))
             result = _run_diar()
-    print(flush=True)
+    _progress_end()
     # pyannote 4.x 回傳 DiarizeOutput 物件，3.x 直接回傳 Annotation
     diar = getattr(result, "speaker_diarization", result)
 
@@ -868,13 +1020,11 @@ def separate_speakers(
         if not segs:
             _info(f"說話人 {i}（{label}）扣掉重疊後沒有可輸出的片段，跳過。")
             continue
-        result = AudioSegment.empty()
-        for s, e in segs:
-            result += audio[s:e]
+        spk_audio = _concat_slices(audio, segs)
         out_path = out_dir / f"{in_path.stem}_speaker{i}{ext}"
-        _export_audio(result, out_path, bitrate)
+        _export_audio(spk_audio, out_path, bitrate)
         _info(f"說話人 {i}（{label}）：{len(segs)} 段，"
-              f"共 {len(result) / 1000:.1f}s → {out_path.name}")
+              f"共 {len(spk_audio) / 1000:.1f}s → {out_path.name}")
         outputs.append(str(out_path))
 
     _info(f"完成！輸出在 {out_dir}")
@@ -957,7 +1107,8 @@ def pipeline(input_path: str, output_path: str, model: str = "htdemucs",
              device: str = "auto") -> str:
     """一次跑完：分離乾淨人聲 → 去除靜音，輸出成單一檔案。"""
     with tempfile.TemporaryDirectory() as tmp:
-        vocals = separate_vocals(input_path, tmp, model=model, mp3=True,
+        # 中間檔用無損 WAV，整個流程只在最後輸出時編碼一次
+        vocals = separate_vocals(input_path, tmp, model=model, mp3=False,
                                  device=device)
         return trim_silence(
             vocals, output_path,
@@ -1137,6 +1288,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    # 隱藏入口：separate_vocals 用它在子程序裡跑 Demucs（不列在 --help）
+    if argv and argv[0] == "_demucs":
+        _demucs_entry(list(argv[1:]))
+        return
     args = build_parser().parse_args(argv)
 
     if args.command == "gpu":
