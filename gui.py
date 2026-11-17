@@ -89,6 +89,13 @@ I18N = {
         "show_log": "顯示詳細日誌 ▾",
         "hide_log": "隱藏詳細日誌 ▴",
         "done_all": "全部完成",
+        "done_partial": "完成，但有 {} 項失敗",
+        "done_failed": "全部失敗",
+        "done_stopped": "已停止",
+        "msg_failed_t": "有項目失敗",
+        "msg_failed": "成功 {}/{} 項。\n\n失敗的項目：\n{}\n\n原因請看下方的詳細日誌。",
+        "msg_quit_t": "仍在處理中",
+        "msg_quit": "目前還有工作在執行，要停止並關閉嗎？",
         "status_processing": "處理中…",
         "status_stopping": "正在停止…",
         "status_stopped": "已停止（完成 {}/{} 項）",
@@ -194,6 +201,13 @@ I18N = {
         "show_log": "Show log ▾",
         "hide_log": "Hide log ▴",
         "done_all": "All done",
+        "done_partial": "Done, but {} failed",
+        "done_failed": "All failed",
+        "done_stopped": "Stopped",
+        "msg_failed_t": "Some Items Failed",
+        "msg_failed": "{}/{} succeeded.\n\nFailed:\n{}\n\nSee the log below for the reason.",
+        "msg_quit_t": "Still Processing",
+        "msg_quit": "A job is still running. Stop it and close?",
         "status_processing": "Processing…",
         "status_stopping": "Stopping…",
         "status_stopped": "Stopped ({}/{} done)",
@@ -328,9 +342,45 @@ FORMATS  = ["mp3", "wav", "flac", "m4a", "ogg", "opus"]
 BITRATES = ["320k", "256k", "192k", "128k"]
 SUPPORTED_OUT_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus")
 
-_PCT_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%")
+# audio_tool.py 自己回報的進度列，例如 "[progress] 45 segmentation"
+_PROGRESS_RE = re.compile(r"^\[progress\]\s+(\d{1,3})(?:\s+(.*))?$")
 # tqdm / demucs 進度列，例如 " 95%|████▌   | 1117.35/1175.85 [00:39<00:01, 30.91seconds/s]"
-_TQDM_RE = re.compile(r"^(\d{1,3})(?:\.\d+)?%\|")
+# （模型下載時前面還會帶檔名，所以不限定在行首）
+_TQDM_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%\|")
+
+
+def parse_progress(line: str):
+    """
+    判斷一行輸出是不是進度列。是的話回傳 (百分比, 狀態列文字)，否則回傳 None。
+
+    子程序的輸出是用文字模式讀的，\r 會被轉成換行，所以進度列和一般訊息
+    長得一樣都是「一行」，只能靠內容分辨。
+    """
+    line = line.strip()
+    m = _PROGRESS_RE.match(line)
+    if m:
+        pct = min(100, int(m.group(1)))
+        label = (m.group(2) or "").strip()
+        return pct, f"{pct}% · {label}" if label else f"{pct}%"
+    m = _TQDM_RE.search(line)
+    if m:
+        pct = min(100, int(m.group(1)))
+        # 去掉方塊圖形，只留 "95% · 1117.4/1175.9 [00:39<00:01]"
+        tail = line.rsplit("|", 1)[-1].strip()
+        return pct, f"{pct}% · {tail}" if tail else f"{pct}%"
+    return None
+
+
+def unique_path(p: Path) -> Path:
+    """檔名已存在就加 _2、_3…，避免蓋掉之前的結果。"""
+    if not p.exists():
+        return p
+    i = 2
+    while True:
+        q = p.with_name(f"{p.stem}_{i}{p.suffix}")
+        if not q.exists():
+            return q
+        i += 1
 
 
 def fmt_time(sec: float) -> str:
@@ -370,6 +420,7 @@ class App:
         self._build_style()
         self._build_ui()
         self._on_op_change()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_queue)
 
     # ------------------------------------------------------------- 樣式
@@ -489,7 +540,12 @@ class App:
         ttk.Button(btns, text=T("remove_selected"), style="Ghost.TButton",
                    command=self._remove_sel).pack(side="left", padx=(0, 6))
         ttk.Button(btns, text=T("clear"), style="Ghost.TButton",
-                   command=self._clear).pack(side="left")
+                   command=self._clear).pack(side="left", padx=(0, 6))
+        # 調整順序（合併時就是照清單順序接）
+        ttk.Button(btns, text="↑", style="Ghost.TButton", width=2,
+                   command=lambda: self._move(-1)).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="↓", style="Ghost.TButton", width=2,
+                   command=lambda: self._move(1)).pack(side="left")
         self.count_lbl = ttk.Label(btns, text=T("n_files", 0), style="Sub.TLabel")
         self.count_lbl.pack(side="right")
 
@@ -634,6 +690,7 @@ class App:
         out = self.out_var.get()
         op_code = self._op()
         dev = self.dev_var.get()
+        self._stop_previews()
         for w in self.root.winfo_children():
             w.destroy()
         self.files = []
@@ -726,6 +783,26 @@ class App:
         self.listbox.delete(0, tk.END)
         self._update_count()
 
+    def _move(self, delta):
+        """把選取的項目整組上移 (-1) 或下移 (+1) 一格。"""
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        if (delta < 0 and sel[0] == 0) or \
+           (delta > 0 and sel[-1] == len(self.files) - 1):
+            return
+        # 往下移要從最後一個開始搬，才不會互相踩到
+        for i in (sel if delta < 0 else reversed(sel)):
+            j = i + delta
+            self.files[i], self.files[j] = self.files[j], self.files[i]
+            text = self.listbox.get(i)
+            self.listbox.delete(i)
+            self.listbox.insert(j, text)
+        self.listbox.selection_clear(0, tk.END)
+        for i in sel:
+            self.listbox.selection_set(i + delta)
+        self.listbox.see(sel[0] + delta)
+
     def _choose_output(self):
         if self._op() in OP_FILE_OUT:
             p = filedialog.asksaveasfilename(
@@ -761,6 +838,19 @@ class App:
         if op == "speakers" and not has_hf_token():
             messagebox.showwarning(T("msg_no_token_t"), T("msg_no_token"))
             return
+
+        # 輸出位置欄位可能是資料夾，也可能是合併時選的 .mp3 檔名，
+        # 依操作換算成真正要用的路徑。
+        out_path = Path(out)
+        if op in OP_FILE_OUT:
+            if out_path.is_dir() or out_path.suffix.lower() != ".mp3":
+                # 給的是資料夾：把結果放進去（不是在旁邊生出「資料夾名.mp3」）
+                out_path = unique_path(out_path / "merged.mp3")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        elif out_path.suffix.lower() == ".mp3" and not out_path.is_dir():
+            # 欄位裡還留著合併用的檔名：其他操作改用它所在的資料夾
+            out_path = out_path.parent
+        out = str(out_path)
 
         # 剪輯是互動式操作：開波形編輯視窗，輸出由編輯器觸發
         if op == "cut":
@@ -848,25 +938,46 @@ class App:
             return
         self.stop_flag.set()
         self.status.config(text=T("status_stopping"))
+        self._kill_proc()
+
+    def _kill_proc(self):
+        """結束目前的子程序，連同它底下的 demucs / ffmpeg。"""
         proc = self.proc
-        if proc is not None:
-            # 用 taskkill /T 連同 demucs / ffmpeg 子程序一起結束
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                               capture_output=True, creationflags=_NO_WINDOW)
-            else:
-                proc.terminate()
+        if proc is None:
+            return
+        if os.name == "nt":
+            # taskkill /T 會把整棵程序樹一起結束
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, creationflags=_NO_WINDOW)
+        else:
+            proc.terminate()
+
+    def _stop_previews(self):
+        """停掉所有剪輯視窗的試聽（ffplay）。"""
+        for w in self.root.winfo_children():
+            if isinstance(w, CutEditor):
+                w._stop_preview()
+
+    def _on_close(self):
+        """關閉視窗：處理中先確認，並把子程序一起結束，不留在背景繼續跑。"""
+        if self.running:
+            if not messagebox.askyesno(T("msg_quit_t"), T("msg_quit")):
+                return
+            self.stop_flag.set()     # 先設旗標，worker 才不會接著開下一個檔
+            self._kill_proc()
+        self._stop_previews()
+        self.root.destroy()
 
     def _emit_progress(self, line, i, n):
-        """tqdm / demucs 進度列 → 進度條更新；回傳是否已處理（不進日誌）。"""
-        m = _TQDM_RE.match(line)
-        if not m:
+        """進度列 → 進度條更新；回傳是否已處理（不進日誌）。"""
+        prog = parse_progress(line)
+        if prog is None:
             return False
-        pct = min(100, int(float(m.group(1))))
-        self.queue.put(("pct", i, n, pct))
-        # 狀態列顯示乾淨版本：去掉方塊圖形，只留 "95% · 1117.4/1175.9 [00:39<00:01]"
-        tail = line.rsplit("|", 1)[-1].strip()
-        self.queue.put(("sub", f"{pct}% · {tail}" if tail else f"{pct}%"))
+        pct, text = prog
+        # 中途最多顯示 99%：一個項目可能有好幾個階段（例如人聲分離跑到 100%
+        # 後還要去靜音），真正的 100% 由 worker 在子程序成功結束時送出。
+        self.queue.put(("pct", i, n, min(99, pct)))
+        self.queue.put(("sub", text))
         return True
 
     def _worker(self, cmds):
@@ -875,6 +986,7 @@ class App:
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
         n = len(cmds)
         ok = 0
+        failed = []
         for i, cmd in enumerate(cmds, 1):
             if self.stop_flag.is_set():
                 break
@@ -889,50 +1001,33 @@ class App:
                     stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
                     errors="replace", bufsize=1, env=env,
                     creationflags=_NO_WINDOW)
-                # 逐字讀取，並把 \r（進度條更新）與 \n（一般訊息）分開處理，
-                # 否則 Demucs 的 tqdm 進度條（用 \r）會看起來像卡住。
-                buf = ""
-                while True:
-                    ch = self.proc.stdout.read(1)
-                    if not ch:
-                        break
-                    if ch == "\n":
-                        # tqdm 在非終端機環境會改用換行輸出進度列，
-                        # 一樣要攔下來轉成進度條，不然會洗版日誌
-                        line = buf.strip()
-                        if line and not self._emit_progress(line, i, n):
-                            self.queue.put(("log", buf + "\n"))
-                        buf = ""
-                    elif ch == "\r":
-                        line = buf.strip()
-                        buf = ""
-                        if not line:
-                            continue
-                        if self._emit_progress(line, i, n):
-                            continue
-                        m = _PCT_RE.search(line)
-                        if m:
-                            self.queue.put(("pct", i, n, int(m.group(1))))
-                        self.queue.put(("sub", line))
-                    else:
-                        buf += ch
-                if buf.strip():
-                    self.queue.put(("log", buf + "\n"))
+                # 剛好在啟動的瞬間按了停止 / 關視窗：別讓這個程序漏網
+                if self.stop_flag.is_set():
+                    self._kill_proc()
+                # 文字模式下 \r 與 \n 都算換行，所以 tqdm 用 \r 更新的進度
+                # 也是一行一行進來；進度列轉給進度條，其餘寫進日誌。
+                for raw in self.proc.stdout:
+                    line = raw.strip()
+                    if line and not self._emit_progress(line, i, n):
+                        self.queue.put(("log", raw.rstrip("\n") + "\n"))
                 self.proc.wait()
                 if self.proc.returncode == 0:
                     ok += 1
                     self.queue.put(("pct", i, n, 100))
                 elif not self.stop_flag.is_set():
+                    failed.append(name)
                     self.queue.put(("log", T("log_fail", self.proc.returncode)))
             except Exception as e:
+                failed.append(name)
                 self.queue.put(("log", T("log_err", e)))
             finally:
                 self.proc = None
-        if self.stop_flag.is_set():
+        stopped = self.stop_flag.is_set()
+        if stopped:
             msg = T("status_stopped", ok, n)
         else:
             msg = T("status_done", ok, n)
-        self.queue.put(("done", ok, n, msg))
+        self.queue.put(("done", ok, n, msg, failed, stopped))
 
     def _drain_queue(self):
         try:
@@ -958,15 +1053,32 @@ class App:
                 elif kind == "sub":
                     self.status.config(text=item[1][:90])
                 elif kind == "done":
-                    _, ok, n, msg = item
+                    _, ok, n, msg, failed, stopped = item
                     self._log(f"\n===== {msg} =====\n")
                     self.status.config(text=msg)
-                    self.file_lbl.config(
-                        text=T("not_started") if ok == 0 else T("done_all"))
+                    if stopped:
+                        label = T("done_stopped")
+                    elif not failed:
+                        label = T("done_all")
+                    elif ok == 0:
+                        label = T("done_failed")
+                    else:
+                        label = T("done_partial", len(failed))
+                    self.file_lbl.config(text=label)
                     self.running = False
                     self.run_btn.config(state="normal")
                     self.stop_btn.config(state="disabled")
-                    messagebox.showinfo(T("msg_done_t"), msg)
+                    if failed and not stopped:
+                        # 失敗原因在日誌裡，直接攤開給使用者看
+                        if not self.log_visible:
+                            self._toggle_log()
+                        names = "\n".join(failed[:10])
+                        if len(failed) > 10:
+                            names += "\n…"
+                        messagebox.showwarning(
+                            T("msg_failed_t"), T("msg_failed", ok, n, names))
+                    else:
+                        messagebox.showinfo(T("msg_done_t"), msg)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_queue)

@@ -79,7 +79,7 @@ py audio_tool.py vocals input.mp3 -o separated/
 - 輸出 `separated/htdemucs/input/vocals.mp3`（乾淨人聲）
   與 `no_vocals.mp3`（伴奏 / 背景）。
 - 第一次執行會自動下載模型。
-- 加 `--wav` 可輸出無損 wav；`-m mdx_extra` 可換模型。
+- 加 `--wav` 輸出 24-bit 無損 wav（由 Demucs 直接寫出，不經過 MP3）；`-m mdx_extra` 可換模型。
 - **GPU**：預設 `-d auto` 會自動偵測；裝好 ROCm 版後可明確指定 `-d cuda` 用 AMD GPU，
   或 `-d cpu` 強制用 CPU。先用 `audio_tool.py gpu` 確認 GPU 有被抓到。
 
@@ -101,6 +101,7 @@ py audio_tool.py merge a.mp3 b.mp3 c.wav -o final.mp3
 ```
 
 - 依參數順序串接。
+- `-o` 給的是資料夾時，會輸出成該資料夾裡的 `merged.mp3`。
 - `--crossfade 1000` 可讓相鄰段落交叉淡入淡出 1 秒。
 - `--bitrate 320k` 設定音質。
 
@@ -109,6 +110,8 @@ py audio_tool.py merge a.mp3 b.mp3 c.wav -o final.mp3
 ```powershell
 py audio_tool.py pipeline input.mp3 -o vocals_clean.mp3
 ```
+
+中間的人聲檔用無損 WAV 傳遞，整個流程只在最後輸出時編碼一次。
 
 ### 5. 影片轉音檔
 
@@ -220,8 +223,13 @@ py audio_tool.py batch 歌曲夾 -o 輸出夾 --op pipeline -d cuda
 用法：把檔案 / 影片**拖進視窗**（或按「加入檔案 / 加入資料夾」）→ 選操作與裝置 →
 設定輸出位置 → 按「開始處理」。
 
-- **雙進度條**：上方是目前檔案的即時進度（含 Demucs %），下方是整體進度（第幾個 / 共幾個）。
-- **停止按鈕**：可隨時中斷，會連同 Demucs / ffmpeg 子程序一起結束。
+- **雙進度條**：上方是目前檔案的即時進度（人聲分離、分離說話人、轉檔、分割、標準化都有百分比），
+  下方是整體進度（第幾個 / 共幾個）。
+- **停止按鈕**：可隨時中斷，會連同 Demucs / ffmpeg 子程序一起結束。處理中直接關視窗也會先詢問，
+  確認後一併結束，不會留在背景繼續跑。
+- **失敗提示**：有檔案失敗時會跳警告、列出失敗的檔名，並自動展開詳細日誌。
+- **調整順序**：清單下方的 ↑ / ↓ 可移動選取的檔案（合併時就是照清單順序接）。
+- **合併**：輸出位置是資料夾時，結果存成該資料夾裡的 `merged.mp3`（已存在就改用 `merged_2.mp3`…）。
 - 「音訊轉檔」「分割音檔」「音量標準化」選了之後會出現對應的格式 / 位元率 / 每段長度 / 標準選項。
 - 詳細日誌預設收合，需要時按「顯示詳細日誌」展開。
 - **介面語言**：右上角下拉選單可切換 繁體中文 / English，選擇會記住（存在 `gui_settings.json`）。
